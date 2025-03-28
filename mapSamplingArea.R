@@ -41,7 +41,7 @@ osm_data_wt <- opq(bbox = bbox) %>%
   add_osm_feature(key = 'natural', value = "water") %>%
   osmdata_sf()
 
-unique(land_poly$landuse)
+#unique(land_poly$landuse)
 land_polygons <- opq(bbox = bbox) %>%
   add_osm_feature(key = "landuse", value="aquaculture") %>%
   osmdata_sf()
