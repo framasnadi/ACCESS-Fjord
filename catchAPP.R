@@ -69,7 +69,7 @@ server <- function(input, output, session) {
   # file_path <- "C:/Users/frma6502/Desktop/Other/ShinyAPPnorway/TESTdb.xlsx"  # Replace with your actual file path
   #  file_path <- "TESTdb.xlsx"  # Replace with your actual file path
   file_path <- "simulated_fish_data.xlsx" 
-  file_path2 <- "simulated_environmental_data.xlsx" 
+  file_path2 <-  "simulated_environmental_data.xlsx" 
   
   # Reactive to load fish dataset
   fish_data <- reactive({
