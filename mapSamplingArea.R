@@ -19,8 +19,7 @@ library(osmdata)
 library(sf)
 library(ggplot2)
 
-setwd("C:/Users/frma6502/Desktop/mapNorway")
-
+setwd("C:/Users/frma6502/Desktop/Other/ShinyAPPnorway/ACCESS-FjordAPP")
 # Load the NetCDF bathymetric data
 # Replace "path_to_netcdf" with the actual path to your NetCDF file
 bathymetry <- rast("Mean depth natural colour (with land)/Mean depth natural colour (with land).nc")
