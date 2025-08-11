@@ -1,0 +1,6 @@
+CPUE_File,Stock,Name,EnglishName,ScientificName,StartYear,EndYear,Resilience,r.low,r.hi,Bk.yr,Bk.pr,Bk.pr.low,Bk.pr.hi,e.creep,Comment,Source,MSY.BSM,MSY.BSM.lcl,MSY.BSM.ucl,r.BSM,r.BSM.lcl,r.BSM.ucl,k.BSM,k.BSM.lcl,k.BSM.ucl,B_Bmsy,B_Bmsy.lcl,B_Bmsy.ucl,F_Fmsy,F_Fmsy.lcl,F_Fmsy.ucl
+Cpue_amsy.csv,Cod,Gadus morhua,,Sørfolda_fjord_system,1,12,High,0.37,0.84,6,More than half,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA
+Cpue_amsy.csv,Ling,Molva_molva,,Sørfolda_fjord_system,1,12,High,0.37,0.84,6,More than half,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA
+Cpue_amsy.csv,Halibut,Hippoglossus_hippoglossus,,Sørfolda_fjord_system,1,12,High,0.37,0.84,6,More than half,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA
+Cpue_amsy.csv,Pollock,Pollachius_pollachius,,Sørfolda_fjord_system,1,12,High,0.37,0.84,6,More than half,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA
+Cpue_amsy.csv,Golden redfish,Sebastes_norvegicus,,Sørfolda_fjord_system,1,12,High,0.37,0.84,6,More than half,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA

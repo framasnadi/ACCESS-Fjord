@@ -94,9 +94,9 @@ stations <- data.frame(
   lon = c(15.1268,15.169,15.35,15.45, 15.568,15.51, 15.485  )
 )
 stations <- data.frame(
-  id = c("Stn.B","Stn.A","Stn.C"),
-  lat = c(67.517,67.507,67.532 ),
-  lon = c(15.482,15.4,15.615)
+  id = c("Stn.A","Stn.B","Stn.C","Stn.D"),
+  lat = c(67.517,67.507,67.532, 67.512 ),
+  lon = c(15.482,15.4,15.615, 15.265)
 )
 
 name <- data.frame(
@@ -147,7 +147,10 @@ ggplot() +
   theme(
     panel.border = element_rect(color = "black", fill = NA, size = 1),
     legend.position = "right"
-  )  
+  ) + labs(
+    title = NULL,              # Remove top title
+    caption = "The Sørfolda fjord system. Sampling stations highlighted as red dots, fish farms in purple"
+  )
 
 
 
@@ -157,3 +160,44 @@ bbox_sf <- st_as_sfc(st_bbox(bbox_coords, crs = 4326))  # Create an sf polygon f
 countries <- ne_countries(scale = "large", returnclass = "sf")
 # Clip to your bounding box (only countries that intersect)
 countries_clipped <- st_intersection(countries, bbox_sf)
+
+
+
+
+
+###########################################################
+# calculate Stratum AREA
+bathymetry_cropped_m <- project(bathymetry_cropped, "EPSG:3857")  # meters
+names(bathymetry_cropped_m)
+bathymetry_cropped_m <- bathymetry_cropped_m[["elevation"]] 
+bathymetry_abs <- abs(bathymetry_cropped_m)
+
+# Example strata
+depth_breaks <- c(0, 15, 30, 50, 100, 1000)  # Modify as needed
+depth_labels <- paste(head(depth_breaks, -1), tail(depth_breaks, -1), sep = "-")
+
+rcl_matrix <- cbind(
+  start = head(depth_breaks, -1),
+  end = tail(depth_breaks, -1),
+  class = seq_along(depth_labels)
+)
+
+# Reclassify raster
+depth_classes <- classify(bathymetry_abs, rcl = rcl_matrix)
+
+res_m <- res(depth_classes)  # Resolution in meters
+cell_area_km2 <- prod(res_m) / 1e6  # Convert m² to km²
+
+# Frequency table
+freq_table <- freq(depth_classes) 
+
+# Filter valid classes only and assign labels
+area_by_depth <- as.data.frame(freq_table) %>%
+  filter(value %in% seq_along(depth_labels)) %>%
+  mutate(
+    Depth_Category = depth_labels[value],
+    Area_km2 = count * cell_area_km2
+  )
+
+
+
