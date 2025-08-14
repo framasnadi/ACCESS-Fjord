@@ -203,8 +203,30 @@ server <- function(input, output, session) {
            ),
            
            "Stock Assessment (AMSY)" = fluidPage(
-             fluidRow(column(12, p("The Abundance Maximum Sustainable Yield method (AMSY), is a data-limited assessment method that uses trends in CPUE (or other relative abundance data) plus general knowledge of a species’ resilience to generate estimates of stock health. It tells us whether biomass is likely above or below levels needed for sustainable fishing, even when total catch data are absent. While AMSY is less precise than full data-rich assessments, it gives managers a useful starting point, especially in data-poor situations "))),
-             fluidRow(column(12, uiOutput("species_filter_single2"))),
+             fluidRow(column(12, p(
+               "The Abundance Maximum Sustainable Yield method (AMSY; ",
+               tags$a(href = "https://doi.org/10.1093/icesjms/fsz230", "Froese et al. 2020", target = "_blank"),
+               ") is a data-limited assessment model that uses trends in CPUE (or other relative abundance data) plus general knowledge of a species’ resilience to generate estimates of stock health. It tells us whether biomass is likely above or below levels needed for sustainable fishing, even when total catch data are absent. While AMSY is less precise than full data-rich assessments, it gives managers a useful starting point, especially in data-poor situations"
+             ))),
+             
+             fluidRow(column(12, uiOutput("species_filter_single2"))), # Species
+            # fluidRow(column(12, uiOutput("resilience_ui"))), # Resilience prior
+             fluidRow(column(12, uiOutput("bkpr_ui"))), # stock size prior
+             # Add the button that triggers the model
+            fluidRow(
+              column(
+                12,
+                div(
+                  style = "text-align:center; margin-top:15px;",
+                  actionButton(
+                    inputId = "run_model",
+                    label = "RUN model",
+                    icon = icon("play"),
+                    style = "padding: 12px 24px; font-size: 18px;"  # bigger button
+                  )
+                )
+              )
+            ),
             # fluidRow(column(12, plotOutput("amsyPlot1", width = "100%"))),
              fluidRow(column(12, plotOutput("amsyPlot2", width = "100%"))),
              fluidRow(column(12, p("• Relative stock size (B/Bmsy): how current biomass compares to the level that would produce maximum sustainable yield."))),
@@ -220,7 +242,6 @@ server <- function(input, output, session) {
            )
     )
   })
-  
   
   # Dynamically generate filters based on uploaded data
   output$fisherman_filter <- renderUI({
@@ -475,17 +496,64 @@ server <- function(input, output, session) {
     
   })
   
-
+  #############################################################
+  #############################################################
+  # AMSY PART 
+  # Read the ID file once for UI defaults (adjust path if needed)
+  cinfo_data <- reactive({
+    read.csv("amsy_folder/ALL_IDnorway.csv", header = TRUE, stringsAsFactors = FALSE)
+  })
   
-  
-  aAMSY <- reactive({
-    req(fish_data(), depth_data(), stratum_data() , input$species_single)  # Ensure fish_data and env_data are available)
-    data <- fish_data() # %>% filter(Species == input$species_single)
+  # Build the Resilience selectInput with the stock's default
+  output$resilience_ui <- renderUI({
+    req(cinfo_data(), input$species_single)
+    df <- cinfo_data()
+    current <- df$Resilience[df$Stock == input$species_single]
+    # fallback if not found
+    default_val <- if (length(current) && !is.na(current[1])) current[1] else "Medium"
     
+    selectInput(
+      inputId = "resilience",
+      label   = "Resilience",
+      choices = c("Very low","Low","Medium","High"),
+      selected = default_val,
+      width = "300px"
+    )
+  })
+  
+  # Build the Bk.pr selectInput with the stock's default from file
+  output$bkpr_ui <- renderUI({
+    req(cinfo_data(), input$species_single)
+    df <- cinfo_data()
+    current <- df$Bk.pr[df$Stock == input$species_single]
+    default_val <- if (length(current) && !is.na(current[1])) current[1] else "About half"
+    
+    tagList(
+      selectInput(
+        inputId = "bk_pr",
+        label   = "Relative stock size (biomass prior)",
+        choices = c("Near unexploited","More than half","About half","Small","Very small"),
+        selected = default_val,
+        width = "300px"
+      ),
+      tags$small(
+        "A prior for relative stock size can be derived from experts/fishermen who are asked how stock size was in a year of their choice compared to past stock size when there was little fishing of the species. For example, if the stock was only lightly fished in the beginning of the time series, it is reasonable to assume that stock size was more than half of the unexploited level in those years."
+      )
+    )
+  })
+  
+  aAMSY <- eventReactive(input$run_model,{
+    req(fish_data(), depth_data(), stratum_data() , input$species_single)  # Ensure fish_data and env_data are available)
+    
+    #  Show a progress bar while running
+    withProgress(message = "Running AMSY…", value = 0, {
+      incProgress(0.1, detail = "Preparing data")
+      
+    data <- fish_data() 
     depth_station <- depth_data()
     stratum_info <- stratum_data()
     
-    # extract month fom Date
+    # extract month from Date
     #data$Year_Month <- (format(data$Date, "%Y-%m"))
     Season =  quarter(data$Date)
     Year = year(data$Date) # Extract year
@@ -556,6 +624,9 @@ server <- function(input, output, session) {
       select(Stock, Year, Catch, CPUE, Year_season)
     
     cpue_amsy <- cpue_db %>% select(-last_col())
+    
+    incProgress(0.35, detail = "Running Monte Carlo filtering")
+    
     # write.csv(cpue_amsy, "amsy_folder/Cpue_amsy.csv", row.names = FALSE)
     
     # AMSY MODEL   ####################
@@ -859,8 +930,13 @@ server <- function(input, output, session) {
         
         # assign data from cinfo to vectors
         n            <- n.p
-        res          <- as.character(cinfo$Resilience[cinfo$Stock==stock])
-        res.i        <- which(c("Very low","Low","Medium","High")%in%res) # determines process error strength
+        #res          <- as.character(cinfo$Resilience[cinfo$Stock==stock])
+        # prefer user selection, fallback to file value
+        res_from_file <- as.character(cinfo$Resilience[cinfo$Stock == stock])
+        res <- if (!is.null(input$resilience) && nzchar(input$resilience)) input$resilience else res_from_file
+        res.i <- match(res, c("Very low","Low","Medium","High"))
+        if (is.na(res.i)) stop("Resilience must be one of: Very low, Low, Medium, High")
+        #res.i        <- which(c("Very low","Low","Medium","High")%in%res) # determines process error strength
         if(length(res.i)==0) {stop("Spelling error in resilience in ID file\n")}
         start.yr     <- as.numeric(cinfo$StartYear[cinfo$Stock==stock])
         end.yr       <- as.numeric(cinfo$EndYear[cinfo$Stock==stock])
@@ -869,9 +945,16 @@ server <- function(input, output, session) {
         r.hi         <- as.numeric(cinfo$r.hi[cinfo$Stock==stock])
         user.log.r   <- ifelse(is.na(r.low)==F & is.na(r.hi)==F,TRUE,FALSE)     
         Bk.yr        <- as.numeric(cinfo$Bk.yr[cinfo$Stock==stock])
-        Bk.pr        <- as.character(cinfo$Bk.pr[cinfo$Stock==stock])
-        Bk.pr.low    <- as.numeric(cinfo$Bk.pr.low[cinfo$Stock==stock])
-        Bk.pr.hi     <- as.numeric(cinfo$Bk.pr.hi[cinfo$Stock==stock])
+        # --- OVERRIDE with user choice if provided ---
+        if (!is.null(input$bk_pr) && nzchar(input$bk_pr)) {
+          Bk.pr     <- input$bk_pr
+          Bk.pr.low <- NA_real_
+          Bk.pr.hi  <- NA_real_
+        }
+        stopifnot(Bk.pr %in% c("Near unexploited","More than half","About half","Small","Very small"))
+        #Bk.pr        <- as.character(cinfo$Bk.pr[cinfo$Stock==stock])
+        #Bk.pr.low    <- as.numeric(cinfo$Bk.pr.low[cinfo$Stock==stock])
+        #Bk.pr.hi     <- as.numeric(cinfo$Bk.pr.hi[cinfo$Stock==stock])
         e.creep      <- as.numeric(cinfo$e.creep[cinfo$Stock==stock])
         comment      <- as.character(cinfo$Comment[cinfo$Stock==stock])
         Fmsy.ass     <- as.numeric(cinfo$Fmsy.ass[cinfo$Stock==stock])
@@ -972,16 +1055,20 @@ server <- function(input, output, session) {
         # Determine ranges for relative biomass
         #----------------------------------------------------
         # initial range of B/k from input file
-        if(is.na(Bk.pr.low)==F & is.na(Bk.pr.hi)==F) {
-          prior.Bk <- c(Bk.pr.low,Bk.pr.hi)
+        # NEW: always use the categorical mapping when user picks Bk.pr
+        if (!is.na(Bk.pr.low) && !is.na(Bk.pr.hi) && is.null(input$bk_pr)) {
+          # use file's numeric bounds only if user did NOT override
+          prior.Bk <- c(Bk.pr.low, Bk.pr.hi)
         } else {
-          if(Bk.pr == "Near unexploited") {
-            prior.Bk <- c(0.75,1.0)} else if(Bk.pr == "More than half") {
-              prior.Bk <- c(0.5,0.85)} else if(Bk.pr == "About half") {
-                prior.Bk <- c(0.35,0.65)}    else if(Bk.pr == "Small") {
-                  prior.Bk <- c(0.15,0.4)}  else { # i.e. Bk.pr== "Very small"
-                    prior.Bk <- c(0.01,0.2)} 
-        }  
+          prior.Bk <- switch(
+            Bk.pr,
+            "Near unexploited" = c(0.75, 1.0),
+            "More than half"   = c(0.5,  0.85),
+            "About half"       = c(0.35, 0.65),
+            "Small"            = c(0.15, 0.4),
+            "Very small"       = c(0.01, 0.2)
+          )
+        }
         # us relative range of B/k as relative range for kq
         mean.prior.Bk   <- mean(prior.Bk)
         rr.prior.Bk     <- (mean.prior.Bk-prior.Bk[1])/mean.prior.Bk 
@@ -1293,6 +1380,17 @@ server <- function(input, output, session) {
                 F = c(FFmsy, median(x_FFmsy, na.rm = TRUE))[seq_along(Bkt)]
               )
               
+              nB <- length(Bkt)
+              nF <- length(FFmsy)
+              F_traj <- c(FFmsy, median(x_FFmsy, na.rm = TRUE))
+              F_traj <- F_traj[seq_len(nB)]
+              df_traj <- data.frame(B = Bkt, F = F_traj)
+              df_traj <- df_traj[is.finite(df_traj$B) & is.finite(df_traj$F), , drop = FALSE]
+              
+              # adjust limits to include trajectory
+              max_x <- max(max_x, max(df_traj$B, na.rm = TRUE))
+              max_y <- max(max_y, max(df_traj$F, na.rm = TRUE))
+              
               Pr.green  <- mean(y_BBmsy > 1 & x_FFmsy < 1, na.rm = TRUE) * 100
               Pr.red    <- mean(y_BBmsy < 1 & x_FFmsy > 1, na.rm = TRUE) * 100
               Pr.yellow <- mean(y_BBmsy < 1 & x_FFmsy < 1, na.rm = TRUE) * 100
@@ -1320,14 +1418,15 @@ server <- function(input, output, session) {
                                     breaks = breaks, alpha = 0.6) +
                 geom_hline(yintercept = 1, linetype = 3) +
                 geom_vline(xintercept = 1, linetype = 3) +
-                geom_path(data = df_traj, aes(B, F)) +
-                geom_point(data = df_traj, aes(B, F), size = 1.8) +
-                geom_point(data = df_traj[1, , drop = FALSE], aes(B, F), shape = 22, fill = "white", size = point_size) +
-                geom_point(data = df_traj[length(Bkt), , drop = FALSE], aes(B, F), shape = 24, fill = "white", size = point_size) +
+                geom_path(data = df_traj, aes(B, F), na.rm = TRUE) +
+                geom_point(data = df_traj, aes(B, F), size = 1.8, na.rm = TRUE) +
+                geom_point(data = df_traj[1, , drop = FALSE], aes(B, F), shape = 22, fill = "white", size = point_size, na.rm = TRUE) +
+                geom_point(data = df_traj[length(Bkt), , drop = FALSE], aes(B, F), shape = 24, fill = "white", size = point_size, na.rm = TRUE) +
                 geom_text(data = probs_df, aes(x, y, label = label), inherit.aes = FALSE, hjust = 0, size = 4) +
                 scale_x_continuous(limits = c(0, max_x), expand = c(0, 0), name = expression(B/B[MSY])) +
                 scale_y_continuous(limits = c(0, max_y), expand = c(0, 0), name = ylab_txt) +
                 scale_fill_manual(values = c("grey70","grey50","grey30"), labels = labels, drop = FALSE) +
+                coord_cartesian(xlim = c(0, max_x), ylim = c(0, max_y), clip = "off") + 
                 theme_bw(base_size = 12) +  
                 ggtitle(stock)+
                 theme(
@@ -1472,10 +1571,13 @@ server <- function(input, output, session) {
                          #   filename = "kobe_plot_gg.png",
                          seed = 42) 
     
+    incProgress(0.9, detail = "Finalizing")
+    # Return what the outputs need:
+    kobe
     
   })
   
-  
+}, ignoreInit = TRUE)  
   
   
   
@@ -1781,8 +1883,10 @@ server <- function(input, output, session) {
   #})
   output$amsyPlot2 <- renderPlot({
     req(aAMSY())  # kobeplot
+   
     #kobe
   })
+  
   ################################
   
   
