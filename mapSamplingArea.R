@@ -29,8 +29,8 @@ print(bathymetry)
 
 
 # Define the bounding box for the Sørfold area
-sorfold_bbox_bat <- ext(15.1,  15.8 , 67.425,67.6)  # Bounding box: xmin, xmax, ymin, ymax
-bbox <- c(15.1, 67.425, 15.8, 67.6)
+sorfold_bbox_bat <- ext(14.8,  16 , 67.3,67.7)  # Bounding box: xmin, xmax, ymin, ymax
+bbox <- c(14.8, 67.3, 16, 67.7)
 
 # Query OSM for data within the bounding box 
 osm_data_coast <- opq(bbox = bbox) %>%
@@ -120,7 +120,7 @@ ggplot() +
  # scale_fill_manual(values = colors, name = "Depth Categories")+
   # Contour lines based on categorized depth
   geom_contour(data = bathy_df, aes(x = x, y = y, z = Depth), 
-               breaks = c(-100, -80, -50, -25, -15, -5, 0), 
+               breaks = c(-100, -50, -30, -15, 0), 
                color = "darkblue", size = 0.3) +
  # coord_fixed(xlim = c(sorfold_bbox_bat[1], sorfold_bbox_bat[2]), ylim = c(sorfold_bbox_bat[3], sorfold_bbox_bat[4])) +
   labs(
