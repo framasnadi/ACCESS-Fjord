@@ -15,7 +15,7 @@ library(ggpmisc)
 library(rsconnect)
 library(patchwork)
 library(gam.hp)
-# AMSY libraries
+# AMSY code libraries
 library(coda) 
 library("gplots")
 library(mvtnorm) # used for Kobe plot, ignore version error
@@ -2158,7 +2158,7 @@ Decreased CPUE: Could suggest a decline in fish population, potentially due to o
   
 }
 
-# Run the App
+# Run the App (good luck!)
 shinyApp(ui = ui, server = server)
 
 
