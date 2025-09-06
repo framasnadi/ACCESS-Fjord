@@ -28,7 +28,7 @@ ui <- fluidPage(
   helpText(
     tags$span("Need help? ",
               tags$a(
-                href = "https://www.su.se/english/profiles/frma6502-1.665005",
+                href = "https://terramarefjordgaard.odoo.com/aboutus",
                 HTML("Francesco Masnadi"), 
                 style = "color: #007BFF; text-decoration: none;"
               )
