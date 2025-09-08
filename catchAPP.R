@@ -30,7 +30,8 @@ ui <- fluidPage(
               tags$a(
                 href = "https://terramarefjordgaard.odoo.com/aboutus",
                 HTML("Francesco Masnadi"), 
-                style = "color: #007BFF; text-decoration: none;"
+                style = "color: #007BFF; text-decoration: none;",
+                tags$img(src = "logoENGwebsiteintro.png") #not working
               )
     )
   ),
@@ -1754,6 +1755,17 @@ Decreased CPUE: Could suggest a decline in fish population, potentially due to o
   
   
   ###############################################
+  # logo terramare
+  output$logo <- renderImage({
+    filename <-  file.path("logoENGwebsiteintro.png")
+    list(src = filename,
+         width = "100%"
+         # width = 1300,
+         # height = 630,
+         # alt = "z"
+    )
+  }, deleteFile = F)
+  
   # Sampling area Map
   output$samplingmap <- renderImage({
     filename <-  file.path("map.png")
