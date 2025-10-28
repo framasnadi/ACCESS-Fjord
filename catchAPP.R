@@ -15,23 +15,158 @@ library(ggpmisc)
 library(rsconnect)
 library(patchwork)
 library(gam.hp)
+library(grid)
+library(gridExtra)
 # AMSY code libraries
 library(coda) 
 library("gplots")
 library(mvtnorm) # used for Kobe plot, ignore version error
 library(crayon) # to display bold and italics in console
 
+
+
+# ==== Helpers for Y/R, selectivity, and column detection ====
+
+# Find the first column in df whose name matches any regex in `patterns`
+find_col <- function(df, patterns){
+  nms <- names(df)
+  for (p in patterns) {
+    hit <- grep(p, nms, ignore.case = TRUE, perl = TRUE)
+    if (length(hit) > 0) return(nms[hit[1]])
+  }
+  return(NULL)
+}
+
+# Fit length–weight W = a * L^b on log scale; returns list(a, b)
+fit_len_wt <- function(d, len_col, wt_col){
+  L <- suppressWarnings(as.numeric(d[[len_col]]))
+  W <- suppressWarnings(as.numeric(d[[wt_col]]))
+  keep <- is.finite(L) & L > 0 & is.finite(W) & W > 0
+  if (sum(keep) < 5) return(list(a = 3e-5, b = 3))
+  fit <- lm(log(W[keep]) ~ log(L[keep]))
+  list(a = as.numeric(exp(coef(fit)[1])), b = as.numeric(coef(fit)[2]))
+}
+
+# Pauly (1980) natural mortality (per year); T in °C
+pauly_M <- function(Linf, K, T){
+  if (!is.finite(T) || T <= 0) return(NA_real_)
+  log10M <- -0.0066 - 0.279*log10(Linf) + 0.6543*log10(K) + 0.4634*log10(T)
+  10^log10M
+}
+
+# Logistic selectivity by length with L50 and L95
+sel_logistic <- function(L, L50, L95){
+  s <- log(19) / (L95 - L50)
+  1 / (1 + exp(-s * (L - L50)))
+}
+
+# Beverton–Holt mean-length estimator for total mortality Z above L'
+estimate_Z_BH <- function(lengths, Lprime, Linf, K){
+  x <- lengths[is.finite(lengths) & lengths > 0]
+  x <- x[x >= Lprime]
+  if (length(x) < 5) return(NA_real_)
+  Lbar <- mean(x, na.rm = TRUE)
+  if (!is.finite(Lbar) || Lbar <= Lprime) return(NA_real_)
+  Z <- K * (Linf - Lbar) / (Lbar - Lprime)
+  if (!is.finite(Z) || Z < 0) NA_real_ else Z
+}
+
+# Yield- and Biomass-per-Recruit sweep over F (Beverton–Holt cohort simulation)
+ypr_sweep <- function(Fvec, Linf, K, t0, a, b, M,
+                      sel_type = "knife", Lc = NA, L50 = NA, L95 = NA,
+                      dt = 0.05, tmax = NULL){
+  
+  # Age grid
+  if (is.null(tmax)) {
+    # time to reach ~99% of Linf (and a reasonable upper bound)
+    tmax <- max(t0 - (1/K)*log(1 - 0.99), 10/K)
+  }
+  ages <- seq(max(0, t0), tmax, by = dt)
+  
+  # Growth and weight
+  L_of_t <- function(t) Linf * (1 - exp(-K * (t - t0)))
+  L <- pmax(L_of_t(ages), 0)
+  W <- a * L^b
+  
+  # Selectivity as a function of length
+  S_len <- if (identical(sel_type, "knife")) {
+    as.numeric(L >= Lc)
+  } else {
+    sel_logistic(L, L50, L95)
+  }
+  
+  # Sweep F
+  out <- lapply(Fvec, function(F){
+    Zt <- M + F * S_len
+    N  <- numeric(length(ages)); N[1] <- 1
+    Yw <- numeric(length(ages))
+    for (i in seq_along(ages)[-1]) {
+      Zi <- Zt[i-1]
+      Fi <- F * S_len[i-1]
+      C  <- if (Zi > 0) N[i-1] * (Fi/Zi) * (1 - exp(-Zi*dt)) else 0     # Baranov catch over dt
+      Yw[i-1] <- C * W[i-1]                                               # weight of catch
+      N[i]    <- N[i-1] * exp(-Zi*dt)                                    # survivors
+    }
+    YR <- sum(Yw, na.rm = TRUE)                 # yield per recruit (weight)
+    BR <- sum(N * W * dt, na.rm = TRUE)         # biomass per recruit (survivor biomass)
+    E  <- F / (F + M)
+    c(F = F, E = E, YR = YR, BR = BR)
+  })
+  as.data.frame(do.call(rbind, out))
+}
+
+# Reference points from the Y/R sweep table
+calc_E05 <- function(df){
+  BR0 <- df$BR[which.min(df$F)]  # BR at F≈0
+  target <- 0.5 * BR0
+  idx <- which.min(abs(df$BR - target))
+  c(E = df$E[idx], F = df$F[idx])
+}
+
+calc_E01 <- function(df){
+  d <- df[order(df$F), ]
+  i2 <- which(d$F > d$F[1])[1]
+  if (is.na(i2) || i2 <= 1) return(c(E = NA_real_, F = NA_real_))
+  slope0 <- (d$YR[i2] - d$YR[1]) / (d$F[i2] - d$F[1])    # initial slope
+  dYdF   <- c(NA, diff(d$YR) / diff(d$F))
+  target <- 0.1 * slope0
+  cand <- which(is.finite(dYdF) & dYdF <= target)
+  if (!length(cand)) return(c(E = tail(d$E, 1), F = tail(d$F, 1)))
+  idx <- cand[1]
+  c(E = d$E[idx], F = d$F[idx])
+}
+
+
 # UI ########################################################################
 ui <- fluidPage(
-  titlePanel("Reel4Science (SIMULATED DATA)"),
+  titlePanel("Reel4Science App (SIMULATED DATA)"),
   helpText(tags$h4("Turn your catches into real science")),
   helpText(
-    tags$span("Need help? ",
+    tags$span("Curious about the story behind this app? Visit our" ,
               tags$a(
+                href = "https://terramarefjordgaard.odoo.com/",
+                HTML("website"), 
+                style = "color: #007BFF; text-decoration: none;"
+                #  tags$img(src = "logoENGwebsiteintro.png") #not working
+              ), "to learn more about the" ,
+              tags$a(
+                href = "https://terramarefjordgaard.odoo.com/access-fjord-project",
+                HTML("ACCESS-Fjord Project"), 
+                style = "color: #007BFF; text-decoration: none;"
+                #  tags$img(src = "logoENGwebsiteintro.png") #not working
+              ), "and" , tags$a(
                 href = "https://terramarefjordgaard.odoo.com/aboutus",
-                HTML("Francesco Masnadi"), 
-                style = "color: #007BFF; text-decoration: none;",
-                tags$img(src = "logoENGwebsiteintro.png") #not working
+                HTML("our vision"), 
+                style = "color: #007BFF; text-decoration: none;"
+                #  tags$img(src = "logoENGwebsiteintro.png") #not working
+              )
+    )
+  ),
+  helpText(
+    tags$span(
+              tags$p(
+                "Need help? ",
+                tags$a(href = "mailto:info@terramarefjordgaard.odoo.com", "Terramare Fjord & Gård")
               )
     )
   ),
@@ -43,8 +178,9 @@ ui <- fluidPage(
                                        "Catch & Release vs Retained",
                                        "Length Frequency Distribution (LFD)",
                                        "Length-Weight (L-W) relationship",
-                                       "CPUE trend",
+                                       "Abundance Index",
                                        "Size-based indicators (L50 - L90)",
+                                       "Y/R Analysis",
                                        "Stock Assessment (AMSY)",
                                        "Environmental Variables",
                                        "Environmental Influence Analysis"),
@@ -146,7 +282,430 @@ server <- function(input, output, session) {
       stop("Unsupported file format. Please use a CSV or Excel file.")
     }
   })
+  
+  
+  # --- Helpers: length at cumulative frequency from LFD ---
+  length_at_cumfreq <- function(lengths, p = 0.5, bin = 1){
+    x <- lengths[is.finite(lengths) & lengths > 0]
+    if (length(x) < 15) return(NA_real_)
+    brks <- seq(floor(min(x)), ceiling(max(x)), by = bin)
+    h <- hist(x, breaks = brks, plot = FALSE, right = FALSE)
+    if (sum(h$counts) == 0) return(NA_real_)
+    cf <- cumsum(h$counts) / sum(h$counts)
+    j <- which(cf >= p)[1]
+    if (is.na(j)) return(NA_real_)
+    if (j == 1) return(h$mids[1])
+    # linear interpolation to exact p between bins
+    p0 <- cf[j-1]; p1 <- cf[j]
+    L0 <- h$mids[j-1]; L1 <- h$mids[j]
+    L0 + (p - p0) / (p1 - p0) * (L1 - L0)
+  }
+  
+  # === Y/R uses your existing fish_data() ===
+  ypr_raw_data <- reactive({ fish_data() })
+
+  
+  
+  # Species picker built from fish_data()
+  output$species_ui <- renderUI({
+    df <- ypr_raw_data(); if (is.null(df)) return(helpText("Data not found."))
+    sp_col <- find_col(df, c("^species$","species","sp_name","scientific","common"))
+    if (is.null(sp_col)) helpText("No species column detected — using all data.")
+    else {
+      ch <- sort(unique(as.character(df[[sp_col]])))
+      selectInput("species", "Species", choices = ch, selected = ch[1])
+    }
+  })
+  
+#  output$species_ui <- renderUI({
+#    df <- ypr_raw_data(); req(df)
+#    ch <- sort(unique(as.character(df$Species)))
+#    selectInput("ypr_species", "Species (for Y/R page)", choices = ch, selected = ch[1])
+#  })
+  
+  # Y/R-only species dropdown built from the raw fish_data()
+  output$ypr_species_ui <- renderUI({
+    df <- fish_data(); if (is.null(df)) return(NULL)
+    sp_col <- find_col(df, c("^species$","species","sp_name","scientific","common"))
+    if (is.null(sp_col)) sp_col <- "Species"
+    ch <- sort(unique(as.character(df[[sp_col]])))
+    selectInput("ypr_species", "Species (Y/R only):", choices = ch, selected = ch[1])
+  })
+  
+  # lengths for the chosen Y/R species
+  ypr_lengths <- reactive({
+    df <- ypr_raw_data(); req(df)
+    sp <- input$ypr_species
+    d <- if (!is.null(sp)) df[df$Species == sp, , drop = FALSE] else df
+    as.numeric(d$Length)
+  })
+  
+  # Auto L50 (Lc) and L95 from cumulative LFD
+  Lc50_auto <- reactive({ length_at_cumfreq(ypr_lengths(), p = 0.5, bin = 1) })
+  L95_auto  <- reactive({ length_at_cumfreq(ypr_lengths(), p = 0.95, bin = 1) })
+  
+  observeEvent(input$ypr_species, {
+    L50 <- Lc50_auto(); L95 <- L95_auto()
+    if (is.finite(L50)) {
+      updateNumericInput(session, "Lc",  value = round(L50, 1))  # knife-edge
+      updateNumericInput(session, "L50", value = round(L50, 1))  # logistic
+    }
+    if (is.finite(L95)) {
+      updateNumericInput(session, "L95", value = round(L95, 1))
+    }
+  }, ignoreInit = FALSE)
+  
+  output$lc_msg <- renderText({
+    L50 <- Lc50_auto(); L95 <- L95_auto()
+    if (!is.finite(L50)) return("Not enough length data to estimate Lc/L50 from LFD.")
+    paste0("From LFD: Lc/L50 ≈ ", round(L50,1), " cm",
+           if (is.finite(L95)) paste0(", L95 ≈ ", round(L95,1), " cm") else "")
+  })
+  
+  
+  # Optional note for L–W (quiet if no fit)
+  output$lw_fit_msg <- renderUI({ NULL })
+  
+  # Auto-suggest: Lc/L50/L95/L∞, a/b from data when species changes
+  observeEvent(input$ypr_species, {
+    df <- ypr_raw_data(); if (is.null(df)) return()
+    len_col <- find_col(df, c("^length.*cm$","length","len","l_cm"))
+    wt_col  <- find_col(df, c("^weight.*g$","weight","wt","w_g"))
+    sp_col  <- find_col(df, c("^species$","species","sp_name","scientific","common"))
+    d <- df
+    if (!is.null(sp_col) && !is.null(input$ypr_species)) {
+      d <- df[df[[sp_col]] == input$ypr_species, , drop = FALSE]
+    }
+    if(!is.null(len_col) && len_col %in% names(d)){
+      lens <- suppressWarnings(as.numeric(d[[len_col]]))
+      lens <- lens[is.finite(lens) & lens > 0]
+      if(length(lens) >= 10){
+        updateNumericInput(session, "Lc",  value = as.numeric(stats::quantile(lens, 0.4, na.rm=TRUE)))
+        updateNumericInput(session, "L50", value = as.numeric(stats::quantile(lens, 0.5, na.rm=TRUE)))
+        updateNumericInput(session, "L95", value = as.numeric(stats::quantile(lens, 0.8, na.rm=TRUE)))
+        updateNumericInput(session, "linf", value = round(max(lens, na.rm=TRUE)*1.1, 1))
+      }
+    }
+    if(!is.null(len_col) && !is.null(wt_col) && len_col %in% names(d) && wt_col %in% names(d)){
+      fit <- fit_len_wt(d, len_col, wt_col)
+      updateNumericInput(session, "a", value = signif(fit$a,3))
+      updateNumericInput(session, "b", value = signif(fit$b,3))
+    }
+  }, ignoreInit = TRUE)
+  
+  
+  # Pauly M text
+  output$M_pauly_txt <- renderText({
+    req(input$Mmode == "pauly")
+    paste0("Pauly M = ", round(pauly_M(input$linf, input$K, input$T), 3), " per year")
+  })
+  
+  # Estimate current F (hidden; just used for red line)
+  curr_F <- reactive({
+    df <- ypr_raw_data(); if (is.null(df)) return(NA_real_)
+    Muse <- if (input$Mmode == "pauly") pauly_M(input$linf, input$K, input$T) else input$M
+    
+    # Manual F
+    if (identical(input$F_source, "manual")) {
+      return(ifelse(is.na(input$F_curr), NA_real_, input$F_curr))
+    }
+    
+    # Auto F from mean-length (Beverton–Holt Z)
+    sp_col <- find_col(df, c("^species$","species","sp_name","scientific","common"))
+    len_col <- find_col(df, c("^length.*cm$","length","len","l_cm"))
+    if (is.null(len_col)) return(NA_real_)
+    d <- df
+    if (!is.null(sp_col) && !is.null(input$ypr_species))
+      d <- df[df[[sp_col]] == input$ypr_species, , drop = FALSE]
+
+    lengths <- suppressWarnings(as.numeric(d[[len_col]]))
+    lengths <- lengths[is.finite(lengths) & lengths > 0]
+    if (length(lengths) < 20) return(NA_real_)
+    Lprime <- Lprime_for_Z(input$sel_type, input$Lc, input$L50)
+    Zhat <- estimate_Z_BH(lengths, Lprime, input$linf, input$K)
+    if (!is.finite(Zhat)) return(NA_real_)
+    Fhat <- max(Zhat - Muse, 0)
+    Fhat
+  })
+  
+  
+  
+  
+  # Y/R sweep + refs
+  compute_results <- function(){
+    Muse <- if(input$Mmode=="pauly") pauly_M(input$linf, input$K, input$T) else input$M
+    Fvec <- seq(input$F_range[1], input$F_range[2], by = input$F_step)
+    sel_type <- input$sel_type
+    
+    # pick auto from LFD if requested and available; else fall back to user inputs
+    Lc_used  <- if (sel_type == "knife") {
+      if (isTRUE(input$autoLc) && is.finite(Lc50_auto())) Lc50_auto() else input$Lc
+    } else NA_real_
+    
+    L50_used <- if (sel_type == "logistic") {
+      if (isTRUE(input$autoLc) && is.finite(Lc50_auto())) Lc50_auto() else input$L50
+    } else NA_real_
+    
+    L95_used <- if (sel_type == "logistic") {
+      if (isTRUE(input$autoLc) && is.finite(L95_auto()))  L95_auto() else input$L95
+    } else NA_real_
+    
+    df <- ypr_sweep(
+      Fvec, input$linf, input$K, input$t0, input$a, input$b, Muse,
+      sel_type, Lc_used, L50_used, L95_used, dt = 0.01
+    )
+    
+    Emax <- df$E[which.max(df$YR)]; Fmax <- df$F[which.max(df$YR)]
+    e01  <- calc_E01(df); e05 <- calc_E05(df)
+    list(df=df, Muse=Muse, Emax=Emax, Fmax=Fmax,
+         E01=e01["E"], F01=e01["F"], E05=e05["E"], F05=e05["F"])
+  }
+  results <- eventReactive(input$run, compute_results(), ignoreInit = TRUE)
  
+  # --- helpers for MLS/selectivity (Y/R page) ---
+  parse_mls <- function(x){
+    if (is.null(x) || !nzchar(x)) return(numeric(0))
+    suppressWarnings(as.numeric(trimws(unlist(strsplit(x, ",")))))
+  }
+  Lprime_for_Z <- function(sel_type, Lc, L50){
+    if (sel_type == "knife") Lc else L50
+  }
+  
+  
+  ref_lines_df <- reactive({
+    res <- results(); req(res)
+    Fhat <- curr_F()
+    vals <- c(Fhat, res$Fmax, as.numeric(res$F05))
+    labs <- c("Current F", "F at Emax", "F at E0.5")
+    df <- data.frame(x = vals, label = labs, stringsAsFactors = FALSE)
+    df[is.finite(df$x), , drop = FALSE]
+  })
+  
+  
+  ypr_lengths <- reactive({
+    df <- fish_data(); if (is.null(df)) return(numeric(0))
+    sp_col <- find_col(df, c("^species$","species","sp_name","scientific","common"))
+    len_col <- find_col(df, c("^length.*cm$","length","len","l_cm"))
+    if (is.null(sp_col) || is.null(len_col) || is.null(input$ypr_species)) return(numeric(0))
+    L <- suppressWarnings(as.numeric(df[df[[sp_col]] == input$ypr_species, len_col, drop = TRUE]))
+    L[is.finite(L) & L > 0]
+  })
+  
+  output$plot_lfd_sel <- renderPlot({
+    L <- ypr_lengths(); req(length(L) >= 5)
+    
+    # consistent 1-cm bins for both hist() and ggplot
+    brks <- seq(floor(min(L, na.rm = TRUE)), ceiling(max(L, na.rm = TRUE)), by = 1)
+    h <- hist(L, breaks = brks, plot = FALSE)
+    scale_y <- max(h$counts, 1)
+    
+    # selectivity curve on length
+    xcurve <- seq(min(brks), max(brks), length.out = 400)
+    if (identical(input$sel_type, "knife")) {
+      S <- as.numeric(xcurve >= input$Lc)
+    } else {
+      S <- sel_logistic(xcurve, input$L50, input$L95)
+    }
+    sel_df <- data.frame(x = xcurve, y = S * scale_y)
+    
+    library(ggplot2)
+    p <- ggplot(data.frame(L=L), aes(L)) +
+      geom_histogram(binwidth = 1, fill = "grey80", color = "grey30") +
+      geom_line(data = sel_df, aes(x, y), linewidth = 1, color = "red") +
+      theme_bw() +
+      labs(title = "Length–frequency with selectivity overlay",
+           x = "Length (cm)", y = "Frequency")
+    
+    if (identical(input$sel_type, "knife")) {
+      p <- p + geom_vline(xintercept = input$Lc, linetype = 2, color = "red")
+    } else {
+      p <- p +
+        geom_vline(xintercept = input$L50, linetype = 2, color = "red") +
+        geom_vline(xintercept = input$L95, linetype = 3, color = "red")
+    }
+    p
+  })
+  
+  output$plot_lfd_selectivity <- renderPlot({
+    x <- ypr_lengths(); x <- x[is.finite(x) & x > 0]
+    if (length(x) < 15) return(NULL)
+    bin <- 1
+    brks <- seq(floor(min(x)), ceiling(max(x)), by = bin)
+    h <- hist(x, breaks = brks, plot = FALSE, right = FALSE)
+    dd <- data.frame(mid = h$mids, dens = ifelse(max(h$counts) > 0, h$counts / max(h$counts), 0))
+    
+    # choose L50/L95 according to mode and auto toggle
+    L50 <- if (input$sel_type == "knife") {
+      if (isTRUE(input$autoLc) && is.finite(Lc50_auto())) Lc50_auto() else input$Lc
+    } else {
+      if (isTRUE(input$autoLc) && is.finite(Lc50_auto())) Lc50_auto() else input$L50
+    }
+    L95 <- if (input$sel_type == "logistic") {
+      if (isTRUE(input$autoLc) && is.finite(L95_auto())) L95_auto() else input$L95
+    } else NA_real_
+    
+    library(ggplot2)
+    g <- ggplot(dd, aes(mid, dens)) +
+      geom_col(width = bin, alpha = 0.35) +
+      labs(x = "Length (cm)", y = "Relative frequency", title = "LFD + selectivity ogive") +
+      theme_bw()
+    
+    if (input$sel_type == "knife") {
+      if (is.finite(L50)) {
+        g <- g + geom_vline(xintercept = L50, color = "red", linetype = "dashed", linewidth = 1) +
+          annotate("text", x = L50, y = 1, label = paste0("Lc≈", round(L50, 1), " cm"),
+                   vjust = -0.5, hjust = 0, size = 3)
+      }
+    } else {
+      if (is.finite(L50)) {
+        s <- if (is.finite(L95) && L95 > L50) log(19) / (L95 - L50) else 0.5
+        sel_fun <- function(L) 1 / (1 + exp(-s * (L - L50)))
+        xs <- seq(min(dd$mid), max(dd$mid), by = 0.1)
+        g <- g + stat_function(data = data.frame(x = xs), aes(x = x), fun = sel_fun,
+                               linewidth = 1.1, color = "red") +
+          geom_vline(xintercept = L50, linetype = "dashed") +
+          { if (is.finite(L95)) geom_vline(xintercept = L95, linetype = "dotted") else NULL }
+      }
+    }
+    g
+  })
+  
+  
+  # Plots (red = current, green = Emax, blue = E0.5)
+  output$plot_ypr <- renderPlot({
+    res <- results(); req(res)
+    df <- res$df; lines <- ref_lines_df()
+    ggplot(df, aes(F, YR)) +
+      geom_line(size = 1) +
+      geom_vline(data = lines, aes(xintercept = x, color = label), size = 1.4) +
+      scale_color_manual(values = c("Current F" = "#d62728",    # red
+                                    "F at Emax" = "#2ca02c",    # green
+                                    "F at E0.5" = "#1f77b4")) + # blue
+      labs(title = "Yield per Recruit (Y/R)",
+           x = "Fishing mortality F (1/year)", y = "Y/R (weight units)",
+           color = "Reference lines") +
+      theme_minimal(base_size = 13) +
+      theme(legend.position = "top")
+  })
+  
+  output$plot_bpr <- renderPlot({
+    res <- results(); req(res)
+    df <- res$df; BR0 <- df$BR[1]; lines <- ref_lines_df()
+    ggplot(df, aes(F, BR)) +
+      geom_line(size = 1) +
+      geom_hline(yintercept = 0.5*BR0, linetype = 3, alpha = 0.8) +
+      geom_vline(data = lines, aes(xintercept = x, color = label), size = 1.4) +
+      scale_color_manual(values = c("Current F" = "#d62728",
+                                    "F at Emax" = "#2ca02c",
+                                    "F at E0.5" = "#1f77b4")) +
+      labs(title = "Biomass per Recruit (B/R)",
+           x = "Fishing mortality F (1/year)", y = "B/R (weight units)",
+           color = "Reference lines") +
+      theme_minimal(base_size = 13) +
+      theme(legend.position = "top")
+  })
+
+  
+  # Reference table
+  ref_table_data <- reactive({
+    res <- results(); req(res)
+    Fhat <- curr_F()
+    data.frame(
+      Metric = c("M (per year)", "Emax", "F at Emax", "E0.1", "F at E0.1", "E0.5", "F at E0.5",
+                 if (is.finite(Fhat)) "F (current, estimated)" else NULL,
+                 if (is.finite(Fhat)) "E (current, estimated)" else NULL),
+      Value  = c(
+        round(res$Muse, 3),
+        round(res$Emax, 3), round(res$Fmax, 3),
+        round(as.numeric(res$E01), 3), round(as.numeric(res$F01), 3),
+        round(as.numeric(res$E05), 3), round(as.numeric(res$F05), 3),
+        if (is.finite(Fhat)) round(Fhat, 3) else NULL,
+        if (is.finite(Fhat)) round(Fhat/(Fhat + res$Muse), 3) else NULL
+      ),
+      stringsAsFactors = FALSE
+    )
+  })
+  output$ref_table <- renderTable({ ref_table_data() }, striped = TRUE, bordered = TRUE, hover = TRUE)
+  
+  # PDF download (A4)
+  output$download_pdf <- downloadHandler(
+    filename = function(){
+      sp <- tryCatch(as.character(input$ypr_species), error = function(e) "species")
+      paste0("YPR_", sp, "_", Sys.Date(), ".pdf")
+    },
+    content = function(file){
+      res <- isolate(results()); if (is.null(res)) res <- isolate(compute_results())
+      Fhat <- isolate(curr_F())
+      df <- res$df
+      lines <- data.frame(
+        x = c(Fhat, res$Fmax, as.numeric(res$F05)),
+        label = c("Current F", "F at Emax", "F at E0.5")
+      )
+      lines <- lines[is.finite(lines$x), , drop = FALSE]
+      
+      p1 <- ggplot(df, aes(F, YR)) +
+        geom_line(size = 1) +
+        geom_vline(data = lines, aes(xintercept = x, color = label), size = 1.4) +
+        scale_color_manual(values = c("Current F" = "#d62728",
+                                      "F at Emax" = "#2ca02c",
+                                      "F at E0.5" = "#1f77b4")) +
+        labs(title = "Yield per Recruit (Y/R)",
+             x = "Fishing mortality F (1/year)", y = "Y/R (weight units)",
+             color = "Reference lines") +
+        theme_minimal(base_size = 12) +
+        theme(legend.position = "top")
+      
+      BR0 <- df$BR[1]
+      p2 <- ggplot(df, aes(F, BR)) +
+        geom_line(size = 1) +
+        geom_hline(yintercept = 0.5*BR0, linetype = 3, alpha = 0.8) +
+        geom_vline(data = lines, aes(xintercept = x, color = label), size = 1.4) +
+        scale_color_manual(values = c("Current F" = "#d62728",
+                                      "F at Emax" = "#2ca02c",
+                                      "F at E0.5" = "#1f77b4")) +
+        labs(title = "Biomass per Recruit (B/R)",
+             x = "Fishing mortality F (1/year)", y = "B/R (weight units)",
+             color = "Reference lines") +
+        theme_minimal(base_size = 12) +
+        theme(legend.position = "top")
+      
+      tbl <- tableGrob(ref_table_data(), rows = NULL)
+      
+      sp <- tryCatch(as.character(input$ypr_species), error = function(e) "Selected species")
+      Muse <- res$Muse
+      Ehat <- if (is.finite(Fhat)) Fhat/(Fhat + Muse) else NA
+      txt <- paste0(
+        "Yield-per-Recruit (Beverton–Holt) report\n\n",
+        "Species: ", sp, "\n",
+        "Growth: L∞=", input$linf, " cm; K=", input$K, " /yr; t₀=", input$t0, " yr\n",
+        "Length–Weight: W = ", signif(input$a,3), " · L^", signif(input$b,3), "\n",
+        "Natural mortality M = ", round(Muse,3), " /yr (", ifelse(input$Mmode=="pauly", "Pauly", "manual"), ")\n",
+        "Selectivity: ", ifelse(input$sel_type=="knife", paste0("Knife-edge Lc=", input$Lc, " cm"),
+                                paste0("Logistic L50=", input$L50, " cm; L95=", input$L95, " cm")), "\n",
+        "Current F (mean-length): ", ifelse(is.finite(Fhat), round(Fhat,3), "N/A"),
+        "   |   E = ", ifelse(is.finite(Ehat), round(Ehat,3), "N/A"), "\n"
+      )
+      text_grob <- textGrob(txt, x=0.02, y=0.98, just=c("left","top"),
+                            gp = gpar(fontsize=12))
+      
+      grDevices::pdf(file, width = 8.27, height = 11.69) # A4
+      grid.newpage(); grid.draw(text_grob)
+      grid.newpage(); grid.draw(ggplotGrob(p1))
+      grid.newpage(); grid.draw(ggplotGrob(p2))
+      grid.newpage(); grid.draw(tbl)
+      dev.off()
+    }
+  )
+  
+
+  output$mls_viz_ui <- renderUI({
+    req(input$policy_mode)
+    m <- na.omit(parse_mls(input$mls_values))
+    if (length(m) == 0) return(NULL)
+    selectInput("mls_pick", "Which MLS to draw on the LFD plot (cm):",
+                choices = sort(unique(m)), selected = m[1])
+  })
+  
   # dropdown menu page
   output$dynamic_panel <- renderUI({
     switch(input$page_select,
@@ -207,11 +766,11 @@ b < 3 (negative allometry): fish get relatively slimmer as they grow (weight ris
                                    ")))
            ),
            
-           "CPUE trend" = fluidPage(
-             fluidRow(column(12, p("CPUE, or Catch Per Unit Effort, is a key metric in fisheries and conservation biology that measures the number of fish caught relative to a specific unit of fishing effort (in our case number of fisherman per number of fishing hours). It serves as an indirect indicator of fish population abundance and is used to monitor fish stock health and assess the effectiveness of fishing management strategies."))),
+           "Abundance Index" = fluidPage(
+             fluidRow(column(12, p("The Abundance Index represents the estimated total catch per unit effort (CPUE) — the number of fish caught relative to a specific unit of fishing effort (in this case, number of fishers per fishing hours) — derived from standardized survey catches.Values are calculated across predefined depth strata and weighted by the proportional area of each stratum relative to the total study area, providing an unbiased estimate of overall stock abundance. In fisheries science, Abundance and/or Biomass indices are fundamental for tracking stock trends, evaluating exploitation levels, and providing quantitative input to stock assessment models and management advice."))),
              fluidRow(column(12, plotOutput("cpue_plot", width = "100%"))),
-             fluidRow(column(12, p("Increased CPUE: May indicate a recovering fish stock, allowing for increased fishing or potentially indicating more efficient fishing practices. 
-Decreased CPUE: Could suggest a decline in fish population, potentially due to overfishing or other factors. ")))
+             fluidRow(column(12, p("Increased Index: May indicate a recovering or growing fish stock, suggesting improved population status and potential for increased fishing opportunities. 
+Decreased Index: Could suggest a decline in fish population, potentially due to overfishing or other factors. ")))
            ),
            
            "Environmental Variables" = fluidPage(
@@ -219,11 +778,179 @@ Decreased CPUE: Could suggest a decline in fish population, potentially due to o
              fluidRow(column(12, plotOutput("env_plot", width = "100%")))
            ),
            
+           "Y/R Analysis" = fluidPage(
+             fluidRow(column(12, p("The Yield-per-Recruit model estimates the potential yield that each fish cohort can produce under different fishing pressures. Developed by ", tags$a(href = "https://www.scirp.org/reference/referencespapers?referenceid=792194", "Beverton and Holt (1957)", target = "_blank"), ", it links growth, natural mortality, and fishing mortality to identify sustainable exploitation levels such as Emax and E0.5.", tags$a(href = "https://www.fao.org/4/y5997e/y5997e00.htm", "(Gayanilo, Sparre & Pauly, 2005)", target = "_blank"),
+                                   "Because it requires relatively few data inputs, Y/R analysis is especially useful when long time-series data are limited — as often occurs in small-scale or data-poor fisheries. The results help managers evaluate whether a stock is affected by growth overfishing and guide decisions on size limits, effort control, and other management measures to ensure sustainability."))),
+             tags$head(
+               tags$style(HTML("
+      .sticky-panel{position:sticky; top:12px;}
+      .helpbox{background:#f7f9fc;border:1px solid #dde7f3;border-radius:8px;padding:12px;}
+    "))
+             ),
+             fluidRow(
+               # LEFT controls (inside main panel)
+               column(
+                 width = 4,
+                 div(class = "sticky-panel",
+                     h3("Yield-per-Recruit (Y/R)"),
+                     # Inputs help + FishBase tip
+                     tags$details(
+                       open = TRUE,
+                       tags$summary("What inputs do we need?"),
+                       div(class="helpbox",
+                           tags$ul(
+                             tags$li(tags$b("L∞:"), " average maximum length fish would reach if they never died."),
+                             tags$li(tags$b("K:"), " how fast fish grow towards L∞ per year (bigger K = faster growth)."),
+                             tags$li(tags$b("t₀:"), " presents the theoretical age at which an organism would have had a length of zero."),
+                             tags$li(tags$b("a, b:"), " convert length to weight via W = a · L^b."),
+                             tags$li(tags$b("M:"), " natural mortality per year (predation, disease, etc.)."),
+                             tags$li(tags$b("Lc:"), " length at first capture - size where fish start being fully caught by your gear."),
+                             tags$li(tags$b("Where to get values:"),
+                                     HTML(' You can use published <b>L∞</b>, <b>K</b>, and <b>t₀</b> from '),
+                                     HTML('<a href="https://www.fishbase.se/search.php" target="_blank" rel="noopener">FishBase</a>'),
+                                     " as starting points and adjust if local stock info is available.")
+                           )
+                       )
+                     ),
+                     
+                     # Species selector (built from fish_data())
+                     uiOutput("ypr_species_ui"),
+                     tags$hr(),
+                     
+                     # Growth
+                     h4("Growth (VBGF)"),
+                     numericInput("linf", "L∞ (cm)", value = 80, min = 10, step = 1),
+                     numericInput("K",    "K (per year)", value = 0.25, min = 0.01, step = 0.01),
+                     numericInput("t0",   "t₀ (years)", value = -0.5, step = 0.1),
+                     
+                     # Length–Weight
+                     h4("Length–Weight"),
+                     uiOutput("lw_fit_msg"),
+                     numericInput("a", "a", value = 3e-5, min = 1e-7, step = 1e-6),
+                     numericInput("b", "b", value = 3.0,  min = 2.0,  step = 0.01),
+                     
+                     # Natural mortality
+                     h4("Natural mortality M"),
+                     radioButtons("Mmode", "Choose M:",
+                                  c("Set manually" = "manual", "Compute via Pauly (needs T°C)" = "pauly")),
+                     conditionalPanel("input.Mmode == 'manual'",
+                                      numericInput("M", "M (per year)", value = 0.35, min = 0.05, step = 0.01)),
+                     conditionalPanel("input.Mmode == 'pauly'",
+                                      numericInput("T", "Mean habitat temperature (°C)", value = 5, min = -2, step = 0.5),
+                                      verbatimTextOutput("M_pauly_txt")),
+                     
+                     # Fishery selectivity (for Y/R)
+                     h4("Fishery selectivity"),
+                     checkboxInput("autoLc", "Use Lc/L50 from cumulative LFD (50% point)", TRUE),
+                     verbatimTextOutput("lc_msg"),
+                     
+                     radioButtons("sel_type", NULL, c("Knife-edge at Lc" = "knife", "Logistic (L50/L95)" = "logistic")),
+                     conditionalPanel("input.sel_type == 'knife'",
+                                      numericInput("Lc", "Lc (cm)", value = 45, min = 5, step = 1),
+                                      helpText("Tip: start with a lower observed length quantile as Lc.")),
+                     conditionalPanel("input.sel_type == 'logistic'",
+                                      numericInput("L50", "L50 (cm)", value = 45, min = 5, step = 1),
+                                      numericInput("L95", "L95 (cm)", value = 55, min = 6, step = 1)), 
+                     #tags$small(textOutput("lc_msg"))
+                     
+                     # F current
+                     # Fishing mortality
+                     h4("Fishing mortality"),
+                     radioButtons(
+                       "F_source", NULL,
+                       c("Estimate from lengths (Beverton–Holt)" = "auto",
+                         "Manual input (e.g., from AMSY)"        = "manual"),
+                       selected = "auto"
+                     ),
+                     conditionalPanel("input.F_source == 'manual'",
+                                      numericInput("F_curr", "Current F (1/yr)", value = NA, min = 0, step = 0.01)
+                     ),
+                     
+                     # Range & run
+                     h4("F range for Y/R"),
+                     sliderInput("F_range", "F range", min = 0, max = 2.0, value = c(0, 1.2), step = 0.02),
+                     numericInput("F_step", "Step", value = 0.02, min = 0.005, step = 0.005),
+                     
+                     # Management scenarios (for LFD+selectivity overlay)
+                     h4("Management scenarios"),
+                     checkboxInput("policy_mode", "Show MLS overlay on LFD", FALSE),
+                     conditionalPanel("input.policy_mode",
+                                      textInput("mls_values", "MLS candidates (cm, comma-separated)", "40,45,50,55"),
+                                      uiOutput("mls_viz_ui"),   # lets you pick which MLS to draw
+                                      sliderInput("compliance", "Retention compliance above MLS (%)", min = 0, max = 100, value = 100, step = 5)
+                     ),
+                     
+                     fluidRow(
+                       column(
+                         12,
+                         div(
+                           style = "text-align:center; margin-top:15px;",
+                           actionButton(
+                             inputId = "run",
+                             label = "RUN Y/R",
+                             icon = icon("play"),
+                             style = "padding: 12px 24px; font-size: 18px;"  # bigger button
+                           )
+                         )
+                       )
+                     )
+                 )
+               ),
+               
+               # RIGHT outputs
+               column(
+                 width = 8,
+                 
+                 h4("Selectivity on LFD"),
+                 plotOutput("plot_lfd_sel", height = 300),
+                 h4("Y/R plots"),
+                 plotOutput("plot_ypr", height = 360),
+                 plotOutput("plot_bpr", height = 300),
+               
+               #  h4("Your LFD with current selectivity"),
+              #  plotOutput("plot_lfd_sel", height = 260),
+                 
+                 
+                 
+                 
+                 h4("Key reference points"),
+                 tableOutput("ref_table"),
+                 
+                 # Reading help AFTER plots & table
+                 tags$details(
+                   open = TRUE,
+                   tags$summary("How to read the outputs?"),
+                   div(class="helpbox",
+                       tags$ul(
+                         tags$li(tags$b("Emax (peak):"), " the ",
+                                 tags$span(style="color:red;font-weight:600;","red"),
+                                 " line marks F at Emax: the exploitation rate that gives maximum yield per recruit. "),
+                         tags$li(tags$b("E0.5:"), " the ",
+                                 tags$span(style="color:blue;font-weight:600;","blue"),
+                                 " line marks F where B/R ≈ 50% of unfished: the exploitation rate that reduces the average biomass per recruit to 50% of its unfished level."),
+                         tags$li(tags$b("Current F:"), " the ",
+                                 tags$span(style="color:black;font-weight:600;","black"),
+                                 " dashed line shows your estimated current fishing mortality."),
+                         tags$li(tags$b("E = F/(F+M):"), " fraction of total deaths caused by fishing."),
+                         tags$li(tags$b("Typical advice:"), " keep F around/below E0.5 (precaution)"
+                         )
+                       )
+                   )
+                 ),
+                 
+                 # Download button LAST
+                 div(style="margin:16px 0 24px;",
+                     downloadButton("download_pdf", "Download PDF report"))
+               )
+             )
+           ),
+           
+           
            "Stock Assessment (AMSY)" = fluidPage(
              fluidRow(column(12, p(
                "The Abundance Maximum Sustainable Yield method (AMSY; ",
                tags$a(href = "https://doi.org/10.1093/icesjms/fsz230", "Froese et al. 2020", target = "_blank"),
-               ") is a data-limited assessment model that uses trends in CPUE (or other relative abundance data) plus general knowledge of a species’ resilience to generate estimates of stock health. It tells us whether biomass is likely above or below levels needed for sustainable fishing, even when total catch data are absent. While AMSY is less precise than full data-rich assessments, it gives managers a useful starting point, especially in data-poor situations"
+               ") is a data-limited assessment model that uses trends in Abundance or Biomass Indices plus general knowledge of a species’ resilience to generate estimates of stock health. It tells us whether biomass is likely above or below levels needed for sustainable fishing, even when total catch data are absent. While AMSY is less precise than full data-rich assessments, it gives managers a useful starting point, especially in data-poor situations"
              ))),
              
              fluidRow(column(12, uiOutput("species_filter_single2"))), # Species
@@ -251,7 +978,7 @@ Decreased CPUE: Could suggest a decline in fish population, potentially due to o
            ),
            
            "Environmental Influence Analysis" = fluidPage(
-             fluidRow(column(12, p("Environmental-driver analysis helps us tell whether changes in CPUE are due to fihery or also changing conditions (like temperature or salinity). Here we use flexible Generalized Additive Models (GAMs) to show how CPUE varies with each driver. Total deviance explained says how much variation the model captures, and Variable Contributions rank which drivers matter the most."))),
+             fluidRow(column(12, p("Environmental Influence analysis helps determine whether changes in survey CPUE are driven by fishing activity or by environmental variability such as temperature or salinity. Here we use flexible Generalized Additive Models (GAMs) to show how survey CPUE varies with each driver. Total deviance explained says how much variation the model captures, and Variable Contributions rank which drivers matter the most."))),
              fluidRow(column(12, uiOutput("species_filter_single2"))),
              fluidRow(column(12, plotOutput("gam_plot", width = "100%"))),
              fluidRow(column(12, textOutput("gam_details"))),
@@ -2008,8 +2735,8 @@ Decreased CPUE: Could suggest a decline in fish population, potentially due to o
       geom_bar(stat = "identity", position = "identity", alpha = 0.5)+
       geom_smooth(aes(color = Species, group = Species),method = "gam",formula = y ~ s(x), se = FALSE, size = 0.8, linetype="twodash") +  # GAM trend lines using dynamik k
       theme_bw() + 
-      labs(title = "Mean CPUE by Season (Catch/Fisherman/hr)",
-           x = "Date", y = "CPUE",
+      labs(title = "Abundance Index by Season (1-Winter;4-Fall)",
+           x = "Date", y = "Abundance Index",
            fill = "Species") +
       facet_wrap(~ Species, scales = "free_y", ncol = 2) +
       theme(legend.position = "",strip.text = element_text(face = "bold"),axis.text.x = element_text(angle = 90, hjust = 1))
